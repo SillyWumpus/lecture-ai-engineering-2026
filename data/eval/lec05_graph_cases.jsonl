@@ -1,0 +1,2 @@
+{"id": "lora-qlora", "question": "第2回の説明では、LoRAは何を固定し何を学習しますか？ QLoRAは何を加えますか？", "gold": ["lec02-main-p052"], "note": "problem.md STEP 1 の比較用の質問"}
+{"id": "compaction-memory", "question": "第3回の例では、コンパクションとセッションをまたぐメモリはどう違いますか。日々のメモはすべて長期メモリに入りますか", "gold": ["lec03-main-p013", "lec03-main-p039", "lec03-main-p040"], "note": "problem.md STEP 5 の複数ページの例"}

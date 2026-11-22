@@ -22,6 +22,10 @@ RAG_TOP_K = 5
 GRAPH_START_K = 3
 GRAPH_HOPS = 2
 GRAPH_MAX_RESULTS = 10
+# 第5回 宿題(発展): グラフで集めた候補の並べ方。structure（元の並べ方）/ similarity / rrf
+#   例: AIE_GRAPH_RANKING=structure uv run python -m app.agent --graph --trace "..."
+GRAPH_RANKING = os.getenv("AIE_GRAPH_RANKING", "rrf")
+GRAPH_RRF_K = 60  # RRFの定数。小さいほど上位の順位を重く見る
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSIONS = 768
 # 2,048トークンの上限に対し、タスク指定等の分を残す。超過時は切り捨てず停止する。

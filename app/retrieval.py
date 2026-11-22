@@ -17,7 +17,7 @@ import sqlite_vec
 from app.config import (
     EMBEDDING_DIMENSIONS, EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL,
     RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
-    RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
+    RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS, GRAPH_RANKING, GRAPH_RRF_K,
 )
 
 
@@ -124,22 +124,59 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+def embed_query(query: str) -> list[float]:
+    """検索語を確かめてから、質問用の埋め込みを1回だけ作る。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
+    return embed_text(query.strip(), "RETRIEVAL_QUERY")
+
+
+def search_by_vector(vector: list[float], limit: int = RAG_TOP_K) -> list[dict]:
+    """埋め込み済みの質問ベクトルに近いページを最大limit件返す。"""
     with open_index(RAG_DB) as db:
-        vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
         rows = db.execute("""
             SELECT page_id, document_id, lecture, document_title, section, title, page, content,
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
-        """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
+        """, (sqlite_vec.serialize_float32(vector), limit))
         return [dict(row) for row in rows]
 
 
-def search_graph(query: str) -> dict:
-    """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
+def search(query: str) -> list[dict]:
+    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+    return search_by_vector(embed_query(query))
+
+
+def page_distances(vector: list[float], page_ids) -> dict[str, float]:
+    """指定したページと質問ベクトルのコサイン距離を、DBの埋め込みから計算する（APIは呼ばない）。"""
+    page_ids = list(page_ids)
+    if not page_ids:
+        return {}
+    marks = ", ".join("?" for _ in page_ids)
+    with open_index(RAG_DB) as db:
+        rows = db.execute(
+            f"SELECT page_id, vec_distance_cosine(embedding, ?) AS distance FROM chunks WHERE page_id IN ({marks})",
+            [sqlite_vec.serialize_float32(vector), *page_ids])
+        return {row["page_id"]: row["distance"] for row in rows}
+
+
+GRAPH_RANKINGS = ("structure", "similarity", "rrf")
+
+
+def search_graph(query: str, *, ranking: str | None = None,
+                 query_vector: list[float] | None = None) -> dict:
+    """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。
+
+    ranking（既定はconfig.GRAPH_RANKING）で、集めた候補の並べ方を選ぶ。
+      structure : 元の並べ方（hop数 → 経由した用語の接続数 → 入口の順位）
+      similarity: 質問ベクトルとの近さだけで並べる
+      rrf       : 構造の順位と近さの順位を Reciprocal Rank Fusion で混ぜる
+    質問の埋め込みは入口の検索と並べ直しで使い回すので、APIの呼び出しは1回のまま。
+    """
+    ranking = ranking or GRAPH_RANKING
+    if ranking not in GRAPH_RANKINGS:
+        raise ValueError(f"rankingは {GRAPH_RANKINGS} のどれかを指定してください: {ranking}")
+    vector = query_vector if query_vector is not None else embed_query(query)
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
     graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
     nodes = {node["id"]: node for node in graph["nodes"]
@@ -151,7 +188,7 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [hit for hit in search_by_vector(vector) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
@@ -180,9 +217,28 @@ def search_graph(query: str) -> dict:
                              "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
-    expanded = [candidate for _, candidate in sorted(candidates.values())]
+
+    structural = [candidate for _, candidate in sorted(candidates.values())]
+    if ranking == "structure":
+        expanded = structural
+    else:
+        # 候補の経路（hops・path）は構造で決めたものを残し、並び順だけを変える。
+        distances = page_distances(vector, candidates)
+        by_similarity = sorted(structural, key=lambda c: (distances[c["page_id"]], c["page_id"]))
+        if ranking == "similarity":
+            expanded = by_similarity
+        else:
+            # RRF: どちらの並べ方でも上位にある候補ほど高い点。kが大きいほど順位の差をならす。
+            score = defaultdict(float)
+            for order in (structural, by_similarity):
+                for position, candidate in enumerate(order, 1):
+                    score[candidate["page_id"]] += 1 / (GRAPH_RRF_K + position)
+            expanded = sorted(structural, key=lambda c: (-score[c["page_id"]], c["page_id"]))
+        for candidate in expanded:
+            candidate["distance"] = distances[candidate["page_id"]]
     return {"seeds": results, "expanded": expanded[:max(0, GRAPH_MAX_RESULTS - len(results))],
-            "max_hops": GRAPH_HOPS}
+            "max_hops": GRAPH_HOPS, "ranking": ranking,
+            "candidates": len(candidates)}
 
 
 
